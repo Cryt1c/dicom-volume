@@ -8,7 +8,7 @@ documentation = "https://docs.rs/dicom-volume"
 homepage = "https://github.com/Cryt1c/dicom-volume"
 repository = "https://github.com/Cryt1c/dicom-volume"
 license = "Apache-2.0"
-keywords = ["dicom", "medical", "imaging", "volume", "mpr", "3d"]
+keywords = ["dicom", "medical", "imaging", "volume", "mpr"]
 readme = "README.md"
 
 [dependencies]

@@ -1,6 +1,6 @@
 [package]
 name = "dicom-volume"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["David Peherstorfer"]
 edition = "2024"
 description = "A high-level API for handling multiple DICOM files as volumes"
@@ -8,3 +8,9 @@ license = "Apache-2.0"
 keywords = ["dicom", "volume", "3d"]
 
 [dependencies]
+dicom = { version = "0.9.0", features = ["ndarray"] }
+dicom-dictionary-std = "0.9.0"
+image = "0.25.8"
+ndarray = { version = "0.16.1", features = ["rayon"] }
+rayon = "1.11.0"
+thiserror = "2.0.17"

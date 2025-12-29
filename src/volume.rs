@@ -81,7 +81,10 @@ impl Volume {
     // Extract slice to image conversion
     fn slice_to_image(slice: &ArrayView2<'_, f32>) -> Option<ImageBuffer<Luma<u8>, Vec<u8>>> {
         let (height, width) = slice.dim();
-        let pixel_data: Vec<u8> = slice.iter().map(|&v| Self::normalize_to_u8(v)).collect();
+        let pixel_data: Vec<u8> = slice
+            .into_par_iter()
+            .map(|&v| Self::normalize_to_u8(v))
+            .collect();
         ImageBuffer::from_raw(width as u32, height as u32, pixel_data)
     }
 

@@ -7,6 +7,8 @@ use image::Luma;
 use ndarray::Array3;
 use ndarray::ArrayView2;
 use ndarray::s;
+use rayon::iter::IntoParallelIterator;
+use rayon::iter::ParallelIterator;
 
 #[derive(Default)]
 pub struct Volume {
@@ -113,20 +115,22 @@ impl Volume {
         target_height: u32,
     ) -> Option<ImageBuffer<Luma<u8>, Vec<u8>>> {
         let (height, width) = slice.dim();
-        let mut pixel_data = Vec::with_capacity((target_width * target_height) as usize);
-
         let scale_x = (width - 1) as f32 / (target_width - 1).max(1) as f32;
         let scale_y = (height - 1) as f32 / (target_height - 1).max(1) as f32;
 
-        for row in 0..target_height {
-            for col in 0..target_width {
-                let src_y = row as f32 * scale_y;
-                let src_x = col as f32 * scale_x;
-
-                let value = Interpolator::bilinear_interpolate(slice, src_y, src_x);
-                pixel_data.push(Self::normalize_to_u8(value));
-            }
-        }
+        let pixel_data: Vec<u8> = (0..target_height)
+            .into_par_iter()
+            .flat_map(|row| {
+                (0..target_width)
+                    .map(|col| {
+                        let src_y = row as f32 * scale_y;
+                        let src_x = col as f32 * scale_x;
+                        let value = Interpolator::bilinear_interpolate(slice, src_y, src_x);
+                        Self::normalize_to_u8(value)
+                    })
+                    .collect::<Vec<u8>>()
+            })
+            .collect();
 
         ImageBuffer::from_raw(target_width, target_height, pixel_data)
     }

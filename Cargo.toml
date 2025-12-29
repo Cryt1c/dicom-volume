@@ -1,6 +1,6 @@
 [package]
 name = "dicom-volume"
-version = "0.1.2"
+version = "0.1.3"
 authors = ["David Peherstorfer"]
 edition = "2024"
 description = "A high-level API for handling multiple DICOM files as volumes"

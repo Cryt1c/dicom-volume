@@ -56,17 +56,6 @@ impl Volume {
         index: usize,
         orientation: &Orientation,
     ) -> Option<ArrayView2<'_, u16>> {
-        let dim = self.data.dim();
-        let max_index = match orientation {
-            Orientation::Axial => dim.0 - 1,
-            Orientation::Coronal => dim.1 - 1,
-            Orientation::Sagittal => dim.2 - 1,
-        };
-
-        if index > max_index {
-            return None;
-        }
-
         let slice_result = match orientation {
             Orientation::Axial => self.data().slice(s![index, .., ..]),
             Orientation::Coronal => self.data().slice(s![.., index, ..]),
@@ -108,6 +97,9 @@ impl Volume {
         orientation: Orientation,
         interpolation: Interpolation,
     ) -> Option<ImageBuffer<Luma<u8>, Vec<u8>>> {
+        if !self.is_valid_index(index, &orientation) {
+            return None;
+        }
         let slice = self.get_slice_from_axis(index, &orientation)?;
 
         match interpolation {
@@ -128,6 +120,9 @@ impl Volume {
         index: usize,
         orientation: Orientation,
     ) -> Option<ImageBuffer<Luma<u8>, Vec<u8>>> {
+        if !self.is_valid_index(index, &orientation) {
+            return None;
+        }
         let start = web_time::Instant::now();
         let gpu_interpolator = match &self.gpu_interpolator {
             Some(interpolator) => interpolator,
@@ -180,5 +175,15 @@ impl Volume {
             .collect();
 
         ImageBuffer::from_raw(target_width, target_height, pixel_data)
+    }
+
+    fn is_valid_index(&self, index: usize, orientation: &Orientation) -> bool {
+        let dim = self.data.dim();
+        let max_index = match orientation {
+            Orientation::Axial => dim.0,
+            Orientation::Coronal => dim.1,
+            Orientation::Sagittal => dim.2,
+        };
+        index < max_index
     }
 }

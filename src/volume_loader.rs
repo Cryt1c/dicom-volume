@@ -104,7 +104,7 @@ impl VolumeLoader {
     fn extract_image_with_order(
         dicom_object: &FileDicomObject<InMemDicomObject>,
         sort_by: &SortBy,
-    ) -> Option<(Option<f32>, Array2<f32>)> {
+    ) -> Option<(Option<f32>, Array2<u16>)> {
         let order = Self::get_sort_order(dicom_object, sort_by)?;
         let image_2d = Self::decode_image(dicom_object)?;
         Some((order, image_2d))
@@ -146,16 +146,16 @@ impl VolumeLoader {
 
     fn decode_image(
         dicom_object: &FileDicomObject<InMemDicomObject>,
-    ) -> Option<ndarray::ArrayBase<ndarray::OwnedRepr<f32>, ndarray::Dim<[usize; 2]>>> {
+    ) -> Option<ndarray::ArrayBase<ndarray::OwnedRepr<u16>, ndarray::Dim<[usize; 2]>>> {
         let pixel_data = dicom_object.decode_pixel_data().ok()?;
         let options = ConvertOptions::new().with_voi_lut(VoiLutOption::First);
         pixel_data
-            .to_ndarray_with_options::<f32>(&options)
+            .to_ndarray_with_options::<u16>(&options)
             .ok()
             .map(|arr| arr.slice_move(s![0, .., .., 0]))
     }
 
-    fn sort_images(images_with_order: &mut [(Option<f32>, Array2<f32>)], sort_by: SortBy) {
+    fn sort_images(images_with_order: &mut [(Option<f32>, Array2<u16>)], sort_by: SortBy) {
         if !matches!(sort_by, SortBy::None) {
             images_with_order
                 .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -167,7 +167,7 @@ impl VolumeLoader {
     }
 
     fn validate_dimensions(
-        images: &[ndarray::ArrayBase<ndarray::OwnedRepr<f32>, ndarray::Dim<[usize; 2]>>],
+        images: &[ndarray::ArrayBase<ndarray::OwnedRepr<u16>, ndarray::Dim<[usize; 2]>>],
     ) -> Result<(), VolumeLoaderError> {
         let first_dim = images[0].dim();
         if images.iter().any(|img| img.dim() != first_dim) {
@@ -177,11 +177,11 @@ impl VolumeLoader {
     }
 
     fn build_volume_array(
-        images: &[ndarray::ArrayBase<ndarray::OwnedRepr<f32>, ndarray::Dim<[usize; 2]>>],
-    ) -> Array3<f32> {
+        images: &[ndarray::ArrayBase<ndarray::OwnedRepr<u16>, ndarray::Dim<[usize; 2]>>],
+    ) -> Array3<u16> {
         let (height, width) = images[0].dim();
         let depth = images.len();
-        let mut volume = Array3::<f32>::zeros((depth, height, width));
+        let mut volume = Array3::<u16>::zeros((depth, height, width));
 
         for (i, image) in images.iter().enumerate() {
             volume.slice_mut(s![i, .., ..]).assign(image);

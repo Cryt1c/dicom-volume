@@ -20,7 +20,7 @@ impl Interpolator {
     }
 
     #[inline]
-    pub(crate) fn bilinear_interpolate(slice: &ArrayView2<f32>, y: f32, x: f32) -> f32 {
+    pub(crate) fn bilinear_interpolate(slice: &ArrayView2<u16>, y: f32, x: f32) -> u16 {
         let (height, width) = slice.dim();
 
         let y0 = y.floor() as usize;
@@ -33,15 +33,15 @@ impl Interpolator {
         let one_minus_dx = 1.0 - dx;
         let one_minus_dy = 1.0 - dy;
 
-        let v00 = slice[[y0, x0]];
-        let v01 = slice[[y0, x1]];
-        let v10 = slice[[y1, x0]];
-        let v11 = slice[[y1, x1]];
+        let v00 = slice[[y0, x0]] as f32;
+        let v01 = slice[[y0, x1]] as f32;
+        let v10 = slice[[y1, x0]] as f32;
+        let v11 = slice[[y1, x1]] as f32;
 
-        let v0 = v00.mul_add(one_minus_dx, v01 * dx);
-        let v1 = v10.mul_add(one_minus_dx, v11 * dx);
+        let v0 = v00.mul_add(one_minus_dx, v01 as f32 * dx);
+        let v1 = v10.mul_add(one_minus_dx, v11 as f32 * dx);
 
-        v0.mul_add(one_minus_dy, v1 * dy)
+        v0.mul_add(one_minus_dy, v1 * dy) as u16
     }
 }
 

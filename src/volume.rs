@@ -1,5 +1,7 @@
 use crate::enums::Interpolation;
 use crate::enums::Orientation;
+use crate::gpu_interpolator::GpuInterpolator;
+use crate::gpu_interpolator::SliceOrientation;
 use crate::interpolator::Interpolator;
 
 use image::ImageBuffer;
@@ -12,18 +14,20 @@ use rayon::iter::ParallelIterator;
 
 #[derive(Default)]
 pub struct Volume {
-    pub data: Array3<f32>,
+    pub data: Array3<u16>,
     pub spacing: (f32, f32, f32),
     pub interpolated_dim: (u32, u32, u32),
+    pub gpu_interpolator: Option<GpuInterpolator>,
 }
 
 impl Volume {
-    pub fn new(data: Array3<f32>, spacing: (f32, f32, f32)) -> Self {
+    pub fn new(data: Array3<u16>, spacing: (f32, f32, f32)) -> Self {
         let original_dim = data.dim();
         Self {
             data,
             spacing,
             interpolated_dim: Interpolator::get_isotropic_dimensions(spacing, original_dim),
+            gpu_interpolator: None,
         }
     }
 
@@ -33,25 +37,25 @@ impl Volume {
     }
 
     /// Get a reference to the underlying data
-    pub fn data(&self) -> &Array3<f32> {
+    pub fn data(&self) -> &Array3<u16> {
         &self.data
     }
 
     /// Get a mutable reference to the underlying data
-    pub fn data_mut(&mut self) -> &mut Array3<f32> {
+    pub fn data_mut(&mut self) -> &mut Array3<u16> {
         &mut self.data
     }
 
     #[inline]
-    fn normalize_to_u8(value: f32) -> u8 {
-        ((value / 65535.0) * 255.0).clamp(0.0, 255.0) as u8
+    fn normalize_to_u8(value: u16) -> u8 {
+        ((value as f32 / 65535.0) * 255.0).clamp(0.0, 255.0) as u8
     }
 
     pub fn get_slice_from_axis(
         &self,
         index: usize,
         orientation: &Orientation,
-    ) -> Option<ArrayView2<'_, f32>> {
+    ) -> Option<ArrayView2<'_, u16>> {
         let dim = self.data.dim();
         let max_index = match orientation {
             Orientation::Axial => dim.0 - 1,
@@ -78,8 +82,17 @@ impl Volume {
             Orientation::Sagittal => (self.interpolated_dim.2, self.interpolated_dim.0), // (width, depth)
         }
     }
+
+    fn get_plane_spacing_gpu(&self, orientation: &Orientation) -> (u32, u32) {
+        match orientation {
+            Orientation::Axial => (self.interpolated_dim.2, self.interpolated_dim.1), // (width, height)
+            Orientation::Coronal => (self.interpolated_dim.2, self.interpolated_dim.0), // (width, depth)
+            Orientation::Sagittal => (self.interpolated_dim.1, self.interpolated_dim.0), // (height, depth)
+        }
+    }
+
     // Extract slice to image conversion
-    fn slice_to_image(slice: &ArrayView2<'_, f32>) -> Option<ImageBuffer<Luma<u8>, Vec<u8>>> {
+    fn slice_to_image(slice: &ArrayView2<'_, u16>) -> Option<ImageBuffer<Luma<u8>, Vec<u8>>> {
         let (height, width) = slice.dim();
         let pixel_data: Vec<u8> = slice
             .into_par_iter()
@@ -110,10 +123,41 @@ impl Volume {
             }
         }
     }
+    pub async fn get_image_from_axis_gpu(
+        &mut self,
+        index: usize,
+        orientation: Orientation,
+    ) -> Option<ImageBuffer<Luma<u8>, Vec<u8>>> {
+        let start = web_time::Instant::now();
+        let gpu_interpolator = match &self.gpu_interpolator {
+            Some(interpolator) => interpolator,
+            None => {
+                self.gpu_interpolator = Some(GpuInterpolator::new(&self.data, self.spacing).await);
+                self.gpu_interpolator.as_ref().unwrap()
+            }
+        };
+        println!("gpu_interpolator::new: {:?}", start.elapsed());
+        let start = web_time::Instant::now();
+
+        let gpu_orientation = match orientation {
+            Orientation::Axial => SliceOrientation::Axial,
+            Orientation::Coronal => SliceOrientation::Coronal,
+            Orientation::Sagittal => SliceOrientation::Sagittal,
+        };
+
+        let (target_width, target_height) = self.get_plane_spacing_gpu(&orientation);
+
+        let pixel_data = gpu_interpolator
+            .extract_slice(index, gpu_orientation, target_width, target_height)
+            .await;
+        let image_buffer = ImageBuffer::from_raw(target_width, target_height, pixel_data);
+        println!("extract slice: {:?}", start.elapsed());
+        image_buffer
+    }
 
     fn interpolate_slice(
         &self,
-        slice: &ArrayView2<'_, f32>,
+        slice: &ArrayView2<'_, u16>,
         target_width: u32,
         target_height: u32,
     ) -> Option<ImageBuffer<Luma<u8>, Vec<u8>>> {

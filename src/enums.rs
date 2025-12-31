@@ -1,24 +1,15 @@
 #[derive(Clone, Copy)]
 pub enum Orientation {
-    Axial,
-    Coronal,
-    Sagittal,
+    Axial = 0,
+    Coronal = 1,
+    Sagittal = 2,
 }
 
 #[derive(Default)]
 pub enum Interpolation {
-    Bilinear(Processor),
-    // TODO:
-    // Trilinear(Processor),
-    // Cubic(Processor),
+    Linear,
     #[default]
     None,
-}
-
-pub enum Processor {
-    CPU,
-    // TODO:
-    // GPU,
 }
 
 #[derive(Default)]

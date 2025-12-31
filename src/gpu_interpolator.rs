@@ -1,8 +1,8 @@
-use half::f16;
 use ndarray::Array3;
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::borrow::Cow;
 use wgpu::{PollType, util::DeviceExt};
+
+use crate::{enums::Orientation, volume::WGPU};
 
 pub struct GpuInterpolator {
     device: wgpu::Device,
@@ -17,22 +17,11 @@ pub struct GpuInterpolator {
 }
 
 impl GpuInterpolator {
-    pub async fn new(volume_data: &Array3<u16>, spacing: (f32, f32, f32)) -> Self {
+    pub async fn new(volume_data: &Array3<u16>, spacing: (f32, f32, f32), wgpu: WGPU) -> Self {
         let (depth, height, width) = volume_data.dim();
         let (depth, height, width) = (depth as u32, height as u32, width as u32);
+        let WGPU { device, queue } = wgpu;
 
-        let start = web_time::Instant::now();
-        let instance = wgpu::Instance::new(&Default::default());
-        let adapter = instance.request_adapter(&Default::default()).await.unwrap();
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        println!("request adapter: {:?}", start.elapsed());
-
-        let start = web_time::Instant::now();
         // Create 3D texture
         let texture_size = wgpu::Extent3d {
             width,
@@ -50,14 +39,9 @@ impl GpuInterpolator {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        println!("create_texture: {:?}", start.elapsed());
 
         // Upload volume data
-        let start = web_time::Instant::now();
         let data_slice = volume_data.as_slice().expect("Volume must be contiguous");
-        println!("half: {:?}", start.elapsed());
-
-        let start = web_time::Instant::now();
         queue.write_texture(
             wgpu::TexelCopyTextureInfoBase {
                 texture: &volume_texture,
@@ -155,7 +139,6 @@ impl GpuInterpolator {
             compilation_options: Default::default(),
             cache: None,
         });
-        println!("after half: {:?}", start.elapsed());
 
         Self {
             device,
@@ -173,7 +156,7 @@ impl GpuInterpolator {
     pub async fn extract_slice(
         &self,
         slice_index: usize,
-        orientation: SliceOrientation,
+        orientation: Orientation,
         target_width: u32,
         target_height: u32,
     ) -> Vec<u8> {
@@ -284,12 +267,4 @@ impl GpuInterpolator {
         staging_buffer.unmap();
         result
     }
-}
-
-#[repr(u32)]
-#[derive(Copy, Clone, Debug)]
-pub enum SliceOrientation {
-    Axial = 0,
-    Coronal = 1,
-    Sagittal = 2,
 }

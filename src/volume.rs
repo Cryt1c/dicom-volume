@@ -1,7 +1,6 @@
 use crate::enums::Interpolation;
 use crate::enums::Orientation;
 use crate::gpu_interpolator::GpuInterpolator;
-use crate::gpu_interpolator::SliceOrientation;
 use crate::interpolator::Interpolator;
 
 use image::ImageBuffer;
@@ -9,8 +8,9 @@ use image::Luma;
 use ndarray::Array3;
 use ndarray::ArrayView2;
 use ndarray::s;
-use rayon::iter::IntoParallelIterator;
-use rayon::iter::ParallelIterator;
+use rayon::prelude::*;
+use wgpu::Device;
+use wgpu::Queue;
 
 #[derive(Default)]
 pub struct Volume {
@@ -18,6 +18,11 @@ pub struct Volume {
     pub spacing: (f32, f32, f32),
     pub interpolated_dim: (u32, u32, u32),
     pub gpu_interpolator: Option<GpuInterpolator>,
+}
+
+pub struct WGPU {
+    pub device: Device,
+    pub queue: Queue,
 }
 
 impl Volume {
@@ -64,19 +69,21 @@ impl Volume {
         Some(slice_result)
     }
 
-    fn get_plane_spacing(&self, orientation: &Orientation) -> (u32, u32) {
+    fn get_output_dimensions(&self, orientation: &Orientation) -> (u32, u32) {
+        // Always return (width, height) - standard image convention
         match orientation {
-            Orientation::Axial => (self.interpolated_dim.1, self.interpolated_dim.2), // (height, width)
-            Orientation::Coronal => (self.interpolated_dim.1, self.interpolated_dim.0), // (height, depth)
-            Orientation::Sagittal => (self.interpolated_dim.2, self.interpolated_dim.0), // (width, depth)
-        }
-    }
-
-    fn get_plane_spacing_gpu(&self, orientation: &Orientation) -> (u32, u32) {
-        match orientation {
-            Orientation::Axial => (self.interpolated_dim.2, self.interpolated_dim.1), // (width, height)
-            Orientation::Coronal => (self.interpolated_dim.2, self.interpolated_dim.0), // (width, depth)
-            Orientation::Sagittal => (self.interpolated_dim.1, self.interpolated_dim.0), // (height, depth)
+            Orientation::Axial => {
+                // Looking down Z-axis: X is width, Y is height
+                (self.interpolated_dim.2, self.interpolated_dim.1)
+            }
+            Orientation::Coronal => {
+                // Looking down Y-axis: X is width, Z is height
+                (self.interpolated_dim.2, self.interpolated_dim.0)
+            }
+            Orientation::Sagittal => {
+                // Looking down X-axis: Y is width, Z is height
+                (self.interpolated_dim.1, self.interpolated_dim.0)
+            }
         }
     }
 
@@ -91,11 +98,12 @@ impl Volume {
     }
 
     // Simplified get_image_from_axis
-    pub fn get_image_from_axis(
+    pub async fn get_image_from_axis(
         &self,
         index: usize,
         orientation: Orientation,
         interpolation: Interpolation,
+        wgpu: Option<WGPU>,
     ) -> Option<ImageBuffer<Luma<u8>, Vec<u8>>> {
         if !self.is_valid_index(index, &orientation) {
             return None;
@@ -104,69 +112,57 @@ impl Volume {
 
         match interpolation {
             Interpolation::None => Self::slice_to_image(&slice),
-            Interpolation::Bilinear(_) => {
+            Interpolation::Linear => {
                 // Axial doesn't need interpolation (already isotropic in-plane)
                 if matches!(orientation, Orientation::Axial) {
                     return Self::slice_to_image(&slice);
                 }
 
-                let (target_width, target_height) = self.get_plane_spacing(&orientation);
-                self.interpolate_slice(&slice, target_width, target_height)
+                match wgpu {
+                    Some(wgpu) => {
+                        let gpu_interpolator =
+                            GpuInterpolator::new(&self.data, self.spacing, wgpu).await;
+                        let (width, height) = self.get_output_dimensions(&orientation);
+                        let pixel_data = gpu_interpolator
+                            .extract_slice(index, orientation, width, height)
+                            .await;
+
+                        ImageBuffer::from_raw(width, height, pixel_data)
+                    }
+                    None => {
+                        let (width, height) = self.get_output_dimensions(&orientation);
+                        self.interpolate_slice(&slice, width, height)
+                    }
+                }
             }
         }
-    }
-    pub async fn get_image_from_axis_gpu(
-        &mut self,
-        index: usize,
-        orientation: Orientation,
-    ) -> Option<ImageBuffer<Luma<u8>, Vec<u8>>> {
-        if !self.is_valid_index(index, &orientation) {
-            return None;
-        }
-        let start = web_time::Instant::now();
-        let gpu_interpolator = match &self.gpu_interpolator {
-            Some(interpolator) => interpolator,
-            None => {
-                self.gpu_interpolator = Some(GpuInterpolator::new(&self.data, self.spacing).await);
-                self.gpu_interpolator.as_ref().unwrap()
-            }
-        };
-        println!("gpu_interpolator::new: {:?}", start.elapsed());
-        let start = web_time::Instant::now();
-
-        let gpu_orientation = match orientation {
-            Orientation::Axial => SliceOrientation::Axial,
-            Orientation::Coronal => SliceOrientation::Coronal,
-            Orientation::Sagittal => SliceOrientation::Sagittal,
-        };
-
-        let (target_width, target_height) = self.get_plane_spacing_gpu(&orientation);
-
-        let pixel_data = gpu_interpolator
-            .extract_slice(index, gpu_orientation, target_width, target_height)
-            .await;
-        let image_buffer = ImageBuffer::from_raw(target_width, target_height, pixel_data);
-        println!("extract slice: {:?}", start.elapsed());
-        image_buffer
     }
 
     fn interpolate_slice(
         &self,
         slice: &ArrayView2<'_, u16>,
-        target_width: u32,
-        target_height: u32,
+        width: u32,
+        height: u32,
     ) -> Option<ImageBuffer<Luma<u8>, Vec<u8>>> {
-        let (height, width) = slice.dim();
-        let scale_x = (width - 1) as f32 / (target_width - 1).max(1) as f32;
-        let scale_y = (height - 1) as f32 / (target_height - 1).max(1) as f32;
+        let (slice_height, slice_width) = slice.dim();
 
-        let pixel_data: Vec<u8> = (0..target_height)
+        let pixel_data: Vec<u8> = (0..height)
             .into_par_iter()
-            .flat_map(|row| {
-                (0..target_width)
-                    .map(|col| {
-                        let src_y = row as f32 * scale_y;
-                        let src_x = col as f32 * scale_x;
+            .flat_map(|y| {
+                (0..width)
+                    .map(|x| {
+                        // Match GPU: use normalized coordinates with half-pixel offset
+                        let norm_x = (x as f32 + 0.5) / width as f32;
+                        let norm_y = (y as f32 + 0.5) / height as f32;
+
+                        // Convert back to source coordinates
+                        let src_x = norm_x * slice_width as f32 - 0.5;
+                        let src_y = norm_y * slice_height as f32 - 0.5;
+
+                        // Clamp to valid range
+                        let src_x = src_x.max(0.0).min((slice_width - 1) as f32);
+                        let src_y = src_y.max(0.0).min((slice_height - 1) as f32);
+
                         let value = Interpolator::bilinear_interpolate(slice, src_y, src_x);
                         Self::normalize_to_u8(value)
                     })
@@ -174,7 +170,7 @@ impl Volume {
             })
             .collect();
 
-        ImageBuffer::from_raw(target_width, target_height, pixel_data)
+        ImageBuffer::from_raw(width, height, pixel_data)
     }
 
     fn is_valid_index(&self, index: usize, orientation: &Orientation) -> bool {

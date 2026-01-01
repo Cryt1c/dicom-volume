@@ -57,7 +57,7 @@
 //! [`FileDicomObject<InMemDicomObject>`]: https://docs.rs/dicom-object/latest/dicom_object/struct.FileDicomObject.html
 
 pub mod enums;
-mod gpu_interpolator;
+pub mod gpu_interpolator;
 mod interpolator;
 pub mod volume;
 pub mod volume_loader;

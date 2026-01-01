@@ -14,6 +14,10 @@ struct Uniforms {
 @group(0) @binding(2) var<storage, read_write> output_data: array<u32>;
 @group(0) @binding(3) var<uniform> uniforms: Uniforms;
 
+fn sample_dicom_value(coords: vec3<f32>) -> f32 {
+    return textureSampleLevel(volume_texture, volume_sampler, coords, 0.0).r;
+}
+
 fn get_uvw_coords(x: u32, y: u32) -> vec3<f32> {
     let inv_output_width = 1.0 / f32(uniforms.output_width);
     let inv_output_height = 1.0 / f32(uniforms.output_height);
@@ -38,20 +42,6 @@ fn get_uvw_coords(x: u32, y: u32) -> vec3<f32> {
     }
 }
 
-fn sample_dicom_value(coords: vec3<f32>) -> f32 {
-    let sample = textureSampleLevel(volume_texture, volume_sampler, coords, 0.0);
-    
-    // Reconstruct u16 from two u8 channels (stored as normalized floats)
-    let low_byte = sample.r * 255.0;
-    let high_byte = sample.g * 255.0;
-    
-    // Combine bytes: value = low + high * 256
-    let u16_value = low_byte + high_byte * 256.0;
-    
-    // Normalize to [0, 1]
-    return u16_value / 65535.0;
-}
-
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let x = global_id.x;
@@ -63,7 +53,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     
     let uvw = get_uvw_coords(x, y);
     let sampled_value = sample_dicom_value(uvw);
-    
     let u8_value = u32(clamp(sampled_value * 255.0, 0.0, 255.0));
     
     output_data[y * uniforms.output_width + x] = u8_value;

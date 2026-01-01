@@ -2,55 +2,41 @@ use std::path::PathBuf;
 
 use dicom_volume::{
     enums::{Interpolation, Orientation, SortBy},
-    volume::WGPU,
+    gpu_interpolator::GpuInterpolator,
     volume_loader::VolumeLoader,
 };
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let mut volume =
-        VolumeLoader::load_from_directory(&PathBuf::from("dicom"), SortBy::InstanceNumber)
-            .expect("should have loaded files from directory");
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        ..Default::default()
-    });
+    let start = web_time::Instant::now();
+    let volume = VolumeLoader::load_from_directory(&PathBuf::from("dicom"), SortBy::InstanceNumber)
+        .expect("should have loaded files from directory");
+    let gpu_interpolator = GpuInterpolator::new(&volume.data, volume.spacing).await;
 
-    // Request adapter
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            ..Default::default()
-        })
-        .await
-        .expect("Failed to find an appropriate adapter");
-
-    // Request device and queue
-    let (device, queue) = adapter
-        .request_device(&wgpu::DeviceDescriptor {
-            ..Default::default()
-        })
-        .await
-        .expect("Failed to create device");
-
-    let wgpu = WGPU { device, queue };
-
+    println!("request_device: {}ms", start.elapsed().as_millis());
+    let start = web_time::Instant::now();
     let image = volume
         .get_image_from_axis(
             volume.dim().2 / 2,
             Orientation::Coronal,
             Interpolation::Linear,
-            Some(wgpu),
+            Some(&gpu_interpolator),
         )
         .await
         .expect("should have returned image at center of volume");
+
+    println!("gpu: {}ms", start.elapsed().as_millis());
+    let start = web_time::Instant::now();
     let image_cpu = volume
         .get_image_from_axis(
             volume.dim().2 / 2,
             Orientation::Coronal,
-            dicom_volume::enums::Interpolation::Linear,
+            Interpolation::Linear,
             None,
         )
         .await
         .expect("should have returned image at center of volume");
+    println!("cpu: {}ms", start.elapsed().as_millis());
     let _ = image.save("result_gpu.png");
     let _ = image_cpu.save("result_cpu.png");
 }

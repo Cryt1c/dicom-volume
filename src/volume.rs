@@ -17,7 +17,6 @@ pub struct Volume {
     pub data: Array3<u16>,
     pub spacing: (f32, f32, f32),
     pub interpolated_dim: (u32, u32, u32),
-    pub gpu_interpolator: Option<GpuInterpolator>,
 }
 
 pub struct WGPU {
@@ -32,7 +31,6 @@ impl Volume {
             data,
             spacing,
             interpolated_dim: Interpolator::get_isotropic_dimensions(spacing, original_dim),
-            gpu_interpolator: None,
         }
     }
 
@@ -103,47 +101,43 @@ impl Volume {
         index: usize,
         orientation: Orientation,
         interpolation: Interpolation,
-        wgpu: Option<WGPU>,
+        gpu_interpolator: Option<&GpuInterpolator>,
     ) -> Option<ImageBuffer<Luma<u8>, Vec<u8>>> {
         if !self.is_valid_index(index, &orientation) {
             return None;
         }
-        let slice = self.get_slice_from_axis(index, &orientation)?;
 
-        match interpolation {
-            Interpolation::None => Self::slice_to_image(&slice),
-            Interpolation::Linear => {
-                // Axial doesn't need interpolation (already isotropic in-plane)
-                if matches!(orientation, Orientation::Axial) {
-                    return Self::slice_to_image(&slice);
-                }
-
-                match wgpu {
-                    Some(wgpu) => {
-                        let gpu_interpolator =
-                            GpuInterpolator::new(&self.data, self.spacing, wgpu).await;
-                        let (width, height) = self.get_output_dimensions(&orientation);
-                        let pixel_data = gpu_interpolator
-                            .extract_slice(index, orientation, width, height)
-                            .await;
-
-                        ImageBuffer::from_raw(width, height, pixel_data)
-                    }
-                    None => {
-                        let (width, height) = self.get_output_dimensions(&orientation);
-                        self.interpolate_slice(&slice, width, height)
-                    }
-                }
+        let image = match (interpolation, orientation, gpu_interpolator) {
+            // both None and Linear+Axial use the same CPU slice path
+            (Interpolation::None | Interpolation::Linear, Orientation::Axial, _) => {
+                let slice = self.get_slice_from_axis(index, &orientation)?;
+                Self::slice_to_image(&slice)
             }
-        }
+
+            // Linear + GPU available => use GPU
+            (Interpolation::Linear, _, Some(gpu_interpolator)) => {
+                let (width, height) = self.get_output_dimensions(&orientation);
+                let pixel_data = gpu_interpolator
+                    .extract_slice(index, orientation, width, height)
+                    .await;
+                ImageBuffer::from_raw(width, height, pixel_data)
+            }
+
+            // Linear + no GPU => fallback to CPU interpolation
+            (Interpolation::Linear, _, None) => {
+                let (width, height) = self.get_output_dimensions(&orientation);
+                let slice = self.get_slice_from_axis(index, &orientation)?;
+                let pixel_data = self.interpolate_slice(&slice, width, height);
+                ImageBuffer::from_raw(width, height, pixel_data)
+            }
+
+            // other combos (if any) — adjust as needed
+            _ => unreachable!(),
+        };
+        image
     }
 
-    fn interpolate_slice(
-        &self,
-        slice: &ArrayView2<'_, u16>,
-        width: u32,
-        height: u32,
-    ) -> Option<ImageBuffer<Luma<u8>, Vec<u8>>> {
+    fn interpolate_slice(&self, slice: &ArrayView2<'_, u16>, width: u32, height: u32) -> Vec<u8> {
         let (slice_height, slice_width) = slice.dim();
 
         let pixel_data: Vec<u8> = (0..height)
@@ -170,7 +164,7 @@ impl Volume {
             })
             .collect();
 
-        ImageBuffer::from_raw(width, height, pixel_data)
+        return pixel_data;
     }
 
     fn is_valid_index(&self, index: usize, orientation: &Orientation) -> bool {

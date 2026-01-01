@@ -1,8 +1,9 @@
+use half::f16;
 use ndarray::Array3;
 use std::borrow::Cow;
 use wgpu::{PollType, util::DeviceExt};
 
-use crate::{enums::Orientation, volume::WGPU};
+use crate::enums::Orientation;
 
 pub struct GpuInterpolator {
     device: wgpu::Device,
@@ -17,10 +18,28 @@ pub struct GpuInterpolator {
 }
 
 impl GpuInterpolator {
-    pub async fn new(volume_data: &Array3<u16>, spacing: (f32, f32, f32), wgpu: WGPU) -> Self {
+    pub async fn new(volume_data: &Array3<u16>, spacing: (f32, f32, f32)) -> Self {
         let (depth, height, width) = volume_data.dim();
         let (depth, height, width) = (depth as u32, height as u32, width as u32);
-        let WGPU { device, queue } = wgpu;
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            ..Default::default()
+        });
+
+        // Request adapter
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                ..Default::default()
+            })
+            .await
+            .expect("Failed to find an appropriate adapter");
+
+        // Request device and queue
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                ..Default::default()
+            })
+            .await
+            .expect("Failed to create device");
 
         // Create 3D texture
         let texture_size = wgpu::Extent3d {
@@ -35,13 +54,17 @@ impl GpuInterpolator {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
-            format: wgpu::TextureFormat::Rg8Unorm,
+            format: wgpu::TextureFormat::R16Float,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
 
         // Upload volume data
         let data_slice = volume_data.as_slice().expect("Volume must be contiguous");
+        let f16_data: Vec<f16> = data_slice
+            .iter()
+            .map(|&v| f16::from_f32(v as f32 / 65535.0))
+            .collect();
         queue.write_texture(
             wgpu::TexelCopyTextureInfoBase {
                 texture: &volume_texture,
@@ -49,10 +72,10 @@ impl GpuInterpolator {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            bytemuck::cast_slice(&data_slice),
+            bytemuck::cast_slice(&f16_data),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(2 * width * std::mem::size_of::<u8>() as u32),
+                bytes_per_row: Some(width * std::mem::size_of::<f16>() as u32),
                 rows_per_image: Some(height),
             },
             texture_size,
@@ -75,7 +98,7 @@ impl GpuInterpolator {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Volume Slice Shader"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
-                "shaders/volume_slice.wgsl"
+                "shaders/volume_slice_f16.wgsl"
             ))),
         });
 
@@ -248,7 +271,9 @@ impl GpuInterpolator {
             0,
             (output_size * std::mem::size_of::<u32>()) as u64,
         );
+
         self.queue.submit(Some(encoder.finish()));
+
         let buffer_slice = staging_buffer.slice(..);
         let (sender, receiver) = futures::channel::oneshot::channel();
         buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
@@ -258,6 +283,7 @@ impl GpuInterpolator {
             submission_index: None,
             timeout: None,
         });
+
         receiver.await.unwrap().unwrap();
         let data = buffer_slice.get_mapped_range();
         let u32_data: &[u32] = bytemuck::cast_slice(&data);

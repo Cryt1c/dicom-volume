@@ -8,12 +8,10 @@ use dicom_volume::{
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let start = web_time::Instant::now();
     let volume = VolumeLoader::load_from_directory(&PathBuf::from("dicom"), SortBy::InstanceNumber)
         .expect("should have loaded files from directory");
     let gpu_interpolator = GpuInterpolator::new(&volume.data, volume.spacing).await;
 
-    println!("request_device: {}ms", start.elapsed().as_millis());
     let start = web_time::Instant::now();
     let image = volume
         .get_image_from_axis(

@@ -110,3 +110,56 @@ fn batched_gpu_matches_single_gpu_and_cpu() {
         assert!(mixed[1].is_some());
     }
 }
+
+/// A volume large enough that the texture upload spans several
+/// `write_texture` chunks (128 layers per 64 MiB chunk: 300 layers -> 3).
+#[test]
+fn gpu_upload_spanning_multiple_chunks_matches_cpu() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("failed to build tokio runtime");
+
+    let (depth, height, width) = (300usize, 512usize, 512usize);
+    let data = Array3::from_shape_fn((depth, height, width), |(z, y, x)| {
+        ((z * 11 + y * 3 + x) % u16::MAX as usize) as u16
+    });
+    let volume = Volume::new(data, (1.0, 1.0, 1.0));
+
+    let Some(mut gpu) = runtime.block_on(GpuInterpolator::try_new(&volume.data, volume.spacing))
+    else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+
+    // Coronal slices span all depth rows, so every uploaded chunk is read.
+    for index in [0, depth / 2, depth - 1] {
+        let gpu_image = runtime
+            .block_on(volume.get_image_from_axis(
+                index,
+                Orientation::Coronal,
+                Interpolation::Linear,
+                Some(&mut gpu),
+            ))
+            .expect("GPU slice");
+        let cpu_image = runtime
+            .block_on(volume.get_image_from_axis(
+                index,
+                Orientation::Coronal,
+                Interpolation::Linear,
+                None,
+            ))
+            .expect("CPU slice");
+
+        assert_eq!(gpu_image.dimensions(), cpu_image.dimensions());
+        let diff: Vec<i32> = gpu_image
+            .as_raw()
+            .iter()
+            .zip(cpu_image.as_raw())
+            .map(|(gpu, cpu)| (*gpu as i32 - *cpu as i32).abs())
+            .collect();
+        let max = diff.iter().copied().max().unwrap_or(0);
+        let mean = diff.iter().map(|d| *d as f64).sum::<f64>() / diff.len() as f64;
+        assert!(mean < 5.0, "coronal index {index}: mean diff {mean}");
+        assert!(max < 20, "coronal index {index}: max diff {max}");
+    }
+}

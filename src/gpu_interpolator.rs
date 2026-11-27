@@ -94,6 +94,21 @@ pub struct GpuInterpolator {
     capacity_bytes: u64,
 }
 
+/// Maximum bytes a single internal upload staging buffer may use.
+const MAX_UPLOAD_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Number of 3D-texture layers to upload per `write_texture` call.
+///
+/// Backends such as Dawn stage each upload internally in a buffer limited by
+/// `max_buffer_size` (256 MiB by default), so uploading a large volume in one
+/// call fails with a buffer-size validation error (e.g. a 512x512x568 f16
+/// upload needs a ~284 MiB staging buffer). Chunking by texture layers keeps
+/// every internal staging buffer small, independent of the adapter's limits.
+fn upload_layers_per_chunk(max_buffer_size: u64, f16_bytes_per_layer: u64) -> u32 {
+    let max_chunk_bytes = max_buffer_size.min(MAX_UPLOAD_CHUNK_BYTES);
+    (max_chunk_bytes / f16_bytes_per_layer).max(1) as u32
+}
+
 impl GpuInterpolator {
     /// Creates the interpolator, panicking when no GPU adapter is available.
     ///
@@ -127,9 +142,16 @@ impl GpuInterpolator {
             .await
             .ok()?;
 
-        // Request device and queue
+        // Request device and queue, asking for the adapter's full
+        // `max_buffer_size` so large internal staging allocations stay valid
+        // even when the default limit (256 MiB) is too small.
+        let mut limits = wgpu::Limits::default();
+        limits.max_buffer_size = adapter.limits().max_buffer_size;
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
+            .request_device(&wgpu::DeviceDescriptor {
+                required_limits: limits,
+                ..Default::default()
+            })
             .await
             .ok()?;
 
@@ -164,21 +186,45 @@ impl GpuInterpolator {
             .par_iter()
             .map(|&value| f16::from_f32(value as f32 / u16::MAX as f32).to_bits())
             .collect();
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfoBase {
-                texture: &volume_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            bytemuck::cast_slice(&volume_bits),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(width * std::mem::size_of::<u16>() as u32),
-                rows_per_image: Some(height),
-            },
-            texture_size,
-        );
+
+        // Upload the volume in depth chunks via `upload_layers_per_chunk`,
+        // so no backend-internal staging buffer exceeds `max_buffer_size`.
+        let f16_bytes_per_layer = width as u64 * height as u64 * std::mem::size_of::<u16>() as u64;
+        let layers_per_chunk =
+            upload_layers_per_chunk(device.limits().max_buffer_size, f16_bytes_per_layer);
+
+        for start in (0..depth).step_by(layers_per_chunk as usize) {
+            let layers = layers_per_chunk.min(depth - start);
+            let layer_texels = width as usize * height as usize;
+            // The data slice must cover exactly the uploaded chunk. On the
+            // web the slice becomes a view over WASM memory, and Dawn sizes
+            // its internal upload staging buffer from the view's byte
+            // length; passing the rest of the volume would still allocate
+            // one giant staging buffer and trip `max_buffer_size`.
+            let begin = start as usize * layer_texels;
+            let end = (start + layers) as usize * layer_texels;
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfoBase {
+                    texture: &volume_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        z: start,
+                        ..Default::default()
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytemuck::cast_slice(&volume_bits[begin..end]),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(width * std::mem::size_of::<u16>() as u32),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d {
+                    depth_or_array_layers: layers,
+                    ..texture_size
+                },
+            );
+        }
 
         let volume_view = volume_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -510,5 +556,39 @@ impl GpuInterpolator {
         self.staging_buffer.unmap();
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::upload_layers_per_chunk;
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn many_layers_fit_per_chunk() {
+        // A 512x512 f16 layer is 512 KiB; 64 MiB / 512 KiB = 128 layers.
+        assert_eq!(upload_layers_per_chunk(256 * MIB, 512 * 512 * 2), 128);
+    }
+
+    #[test]
+    fn chunk_size_is_capped_by_upload_limit_not_device_limit() {
+        // An adapter with a 1 GiB max_buffer_size still chunks at 64 MiB.
+        assert_eq!(upload_layers_per_chunk(1024 * MIB, 512 * 512 * 2), 128);
+    }
+
+    #[test]
+    fn huge_single_layer_falls_back_to_one_layer() {
+        // A layer larger than the chunk cap still uploads one at a time.
+        assert_eq!(upload_layers_per_chunk(256 * MIB, 128 * MIB), 1);
+    }
+
+    #[test]
+    fn tiny_layer_bulks_up() {
+        // An 8x16 f16 layer is 256 bytes -> as many as fit in 64 MiB.
+        assert_eq!(
+            upload_layers_per_chunk(256 * MIB, 8 * 16 * 2),
+            ((64 * MIB) / 256) as u32
+        );
     }
 }

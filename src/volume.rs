@@ -9,22 +9,22 @@ use ndarray::Array3;
 use ndarray::ArrayView2;
 use ndarray::s;
 use rayon::prelude::*;
-use wgpu::Device;
-use wgpu::Queue;
 
+/// A voxel volume with its spacing information.
+///
+/// The data is stored as a `(depth, height, width)` `Array3<u16>`.
 #[derive(Default)]
 pub struct Volume {
+    /// Voxel data as a `(depth, height, width)` array.
     pub data: Array3<u16>,
+    /// Voxel spacing in millimetres as `(x, y, z)`.
     pub spacing: (f32, f32, f32),
+    /// Dimensions of the volume resampled to isotropic voxel spacing.
     pub interpolated_dim: (u32, u32, u32),
 }
 
-pub struct WGPU {
-    pub device: Device,
-    pub queue: Queue,
-}
-
 impl Volume {
+    /// Create a volume from voxel data and voxel spacing.
     pub fn new(data: Array3<u16>, spacing: (f32, f32, f32)) -> Self {
         let original_dim = data.dim();
         Self {
@@ -54,6 +54,10 @@ impl Volume {
         ((value as f32 / 65535.0) * 255.0).clamp(0.0, 255.0) as u8
     }
 
+    /// Get a raw, uninterpolated slice of the volume along the given
+    /// orientation.
+    ///
+    /// Returns `None` when the index is out of bounds.
     pub fn get_slice_from_axis(
         &self,
         index: usize,
@@ -95,19 +99,24 @@ impl Volume {
         ImageBuffer::from_raw(width as u32, height as u32, pixel_data)
     }
 
-    // Simplified get_image_from_axis
+    /// Extract a single slice as an 8-bit grayscale image.
+    ///
+    /// Axial slices are returned uninterpolated; Coronal and Sagittal slices
+    /// are resampled to isotropic dimensions, on the GPU when a
+    /// [`GpuInterpolator`] is supplied together with [`Interpolation::Linear`],
+    /// and on the CPU otherwise. Returns `None` for out-of-bounds indices.
     pub async fn get_image_from_axis(
         &self,
         index: usize,
         orientation: Orientation,
         interpolation: Interpolation,
-        gpu_interpolator: Option<&GpuInterpolator>,
+        gpu_interpolator: Option<&mut GpuInterpolator>,
     ) -> Option<ImageBuffer<Luma<u8>, Vec<u8>>> {
         if !self.is_valid_index(index, &orientation) {
             return None;
         }
 
-        let image = match (interpolation, orientation, gpu_interpolator) {
+        match (interpolation, orientation, gpu_interpolator) {
             // both None and Linear+Axial use the same CPU slice path
             (Interpolation::None | Interpolation::Linear, Orientation::Axial, _) => {
                 let slice = self.get_slice_from_axis(index, &orientation)?;
@@ -131,10 +140,63 @@ impl Volume {
                 ImageBuffer::from_raw(width, height, pixel_data)
             }
 
-            // other combos (if any) — adjust as needed
-            _ => unreachable!(),
-        };
-        image
+            // Unhandled combinations (e.g. a future interpolation mode) yield
+            // no image instead of panicking.
+            _ => None,
+        }
+    }
+
+    /// Extract several slices of the same axis at once.
+    ///
+    /// When a [`GpuInterpolator`] is supplied together with
+    /// [`Interpolation::Linear`], all requested slices are uploaded, dispatched
+    /// and read back in a single batched submission. This is significantly
+    /// faster than calling [`Volume::get_image_from_axis`] in a loop, because
+    /// the GPU round-trip is paid once for the whole batch.
+    ///
+    /// Invalid indices yield `None` in the corresponding output position.
+    pub async fn get_images_from_axis(
+        &self,
+        indices: &[usize],
+        orientation: Orientation,
+        interpolation: Interpolation,
+        mut gpu_interpolator: Option<&mut GpuInterpolator>,
+    ) -> Vec<Option<ImageBuffer<Luma<u8>, Vec<u8>>>> {
+        let gpu_interpolation = matches!(&interpolation, Interpolation::Linear)
+            && !matches!(orientation, Orientation::Axial);
+
+        if let (true, Some(gpu_interpolator)) = (gpu_interpolation, gpu_interpolator.as_mut()) {
+            let mut output: Vec<Option<ImageBuffer<Luma<u8>, Vec<u8>>>> =
+                (0..indices.len()).map(|_| None).collect();
+            let valid: Vec<(usize, usize)> = indices
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, index)| self.is_valid_index(*index, &orientation))
+                .collect();
+
+            if !valid.is_empty() {
+                let valid_indices: Vec<usize> = valid.iter().map(|(_, index)| *index).collect();
+                let (width, height) = self.get_output_dimensions(&orientation);
+                let slices = gpu_interpolator
+                    .extract_slices(&valid_indices, orientation, width, height)
+                    .await;
+                for ((position, _), pixel_data) in valid.into_iter().zip(slices) {
+                    output[position] = ImageBuffer::from_raw(width, height, pixel_data);
+                }
+            }
+
+            return output;
+        }
+
+        let mut output = Vec::with_capacity(indices.len());
+        for &index in indices {
+            output.push(
+                self.get_image_from_axis(index, orientation, interpolation, None)
+                    .await,
+            );
+        }
+        output
     }
 
     fn interpolate_slice(&self, slice: &ArrayView2<'_, u16>, width: u32, height: u32) -> Vec<u8> {
@@ -164,7 +226,7 @@ impl Volume {
             })
             .collect();
 
-        return pixel_data;
+        pixel_data
     }
 
     fn is_valid_index(&self, index: usize, orientation: &Orientation) -> bool {
@@ -175,5 +237,106 @@ impl Volume {
             Orientation::Sagittal => dim.2,
         };
         index < max_index
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+
+    fn volume() -> Volume {
+        // (depth, height, width) = (4, 8, 16) with distinct voxel values.
+        let data = Array3::from_shape_fn((4, 8, 16), |(z, y, x)| (z * 128 + y * 16 + x) as u16);
+        Volume::new(data, (1.0, 1.0, 2.0))
+    }
+
+    #[test]
+    fn is_valid_index_per_orientation() {
+        let v = volume();
+        assert!(v.is_valid_index(3, &Orientation::Axial));
+        assert!(!v.is_valid_index(4, &Orientation::Axial));
+        assert!(v.is_valid_index(7, &Orientation::Coronal));
+        assert!(!v.is_valid_index(8, &Orientation::Coronal));
+        assert!(v.is_valid_index(15, &Orientation::Sagittal));
+        assert!(!v.is_valid_index(16, &Orientation::Sagittal));
+    }
+
+    #[test]
+    fn get_slice_from_axis_returns_expected_dims() {
+        let v = volume();
+        assert_eq!(
+            v.get_slice_from_axis(0, &Orientation::Axial).unwrap().dim(),
+            (8, 16)
+        );
+        assert_eq!(
+            v.get_slice_from_axis(0, &Orientation::Coronal)
+                .unwrap()
+                .dim(),
+            (4, 16)
+        );
+        assert_eq!(
+            v.get_slice_from_axis(0, &Orientation::Sagittal)
+                .unwrap()
+                .dim(),
+            (4, 8)
+        );
+    }
+
+    #[test]
+    fn get_output_dimensions_uses_interpolated_dim() {
+        let v = volume();
+        // spacing (1.0, 1.0, 2.0) resamples depth by 2: (8, 8, 16).
+        assert_eq!(v.interpolated_dim, (8, 8, 16));
+        assert_eq!(v.get_output_dimensions(&Orientation::Axial), (16, 8));
+        assert_eq!(v.get_output_dimensions(&Orientation::Coronal), (16, 8));
+        assert_eq!(v.get_output_dimensions(&Orientation::Sagittal), (8, 8));
+    }
+
+    #[test]
+    fn slice_to_image_normalizes_full_range() {
+        let data = Array2::from_shape_vec((1, 3), vec![0u16, 32768, 65535]).unwrap();
+        let img = Volume::slice_to_image(&data.view()).expect("2-pixel row should convert");
+        assert_eq!((img.width(), img.height()), (3, 1));
+        assert_eq!(img.get_pixel(0, 0).0[0], 0);
+        assert_eq!(img.get_pixel(1, 0).0[0], 127);
+        assert_eq!(img.get_pixel(2, 0).0[0], 255);
+    }
+
+    #[test]
+    fn get_image_from_axis_axial_and_invalid_index() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("failed to build tokio runtime");
+        let v = volume();
+        runtime.block_on(async {
+            let img = v
+                .get_image_from_axis(1, Orientation::Axial, Interpolation::None, None)
+                .await
+                .expect("axial slice should convert");
+            // Axial slices are returned at original resolution.
+            assert_eq!((img.width(), img.height()), (16, 8));
+            assert!(
+                v.get_image_from_axis(99, Orientation::Axial, Interpolation::None, None)
+                    .await
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn get_image_from_axis_coronal_cpu_fallback() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("failed to build tokio runtime");
+        let v = volume();
+        runtime.block_on(async {
+            // No GPU interpolator: Linear must fall back to CPU bilinear.
+            let img = v
+                .get_image_from_axis(2, Orientation::Coronal, Interpolation::Linear, None)
+                .await
+                .expect("coronal slice should convert");
+            assert_eq!((img.width(), img.height()), (16, 8));
+        });
     }
 }

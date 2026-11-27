@@ -38,8 +38,8 @@ impl Interpolator {
         let v10 = slice[[y1, x0]] as f32;
         let v11 = slice[[y1, x1]] as f32;
 
-        let v0 = v00.mul_add(one_minus_dx, v01 as f32 * dx);
-        let v1 = v10.mul_add(one_minus_dx, v11 as f32 * dx);
+        let v0 = v00.mul_add(one_minus_dx, v01 * dx);
+        let v1 = v10.mul_add(one_minus_dx, v11 * dx);
 
         v0.mul_add(one_minus_dy, v1 * dy) as u16
     }

@@ -6,7 +6,13 @@ struct Uniforms {
     volume_width: u32,
     volume_height: u32,
     volume_depth: u32,
-    _padding: u32,
+    // Word offset of this slice inside the shared output buffer.
+    output_offset: u32,
+    // Output row stride in words; every word holds four pixels.
+    output_stride: u32,
+    _padding0: u32,
+    _padding1: u32,
+    _padding2: u32,
 }
 
 @group(0) @binding(0) var volume_texture: texture_3d<f32>;
@@ -44,16 +50,25 @@ fn get_uvw_coords(x: u32, y: u32) -> vec3<f32> {
 
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let x = global_id.x;
+    // Each invocation packs four horizontally adjacent pixels into one word.
+    let word_x = global_id.x;
     let y = global_id.y;
-    
-    if (x >= uniforms.output_width || y >= uniforms.output_height) {
+    let x0 = word_x * 4u;
+
+    if (x0 >= uniforms.output_width || y >= uniforms.output_height) {
         return;
     }
-    
-    let uvw = get_uvw_coords(x, y);
-    let sampled_value = sample_dicom_value(uvw);
-    let u8_value = u32(clamp(sampled_value * 255.0, 0.0, 255.0));
-    
-    output_data[y * uniforms.output_width + x] = u8_value;
+
+    var packed: u32 = 0u;
+    for (var i: u32 = 0u; i < 4u; i = i + 1u) {
+        let x = x0 + i;
+        if (x < uniforms.output_width) {
+            let uvw = get_uvw_coords(x, y);
+            let sampled_value = sample_dicom_value(uvw);
+            let u8_value = u32(clamp(sampled_value * 255.0, 0.0, 255.0));
+            packed = packed | (u8_value << (i * 8u));
+        }
+    }
+
+    output_data[uniforms.output_offset + y * uniforms.output_stride + word_x] = packed;
 }
